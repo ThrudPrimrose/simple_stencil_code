@@ -120,8 +120,9 @@ public:
 
             // Computes the wave propogation depending on the *minecraft* like formula
             // The influx to b from a (a,b) is the same as the outflux from a to b (b,a)
-            // We are computing many updates multiple times which could be improved, but
-            // since the update scheme is not hard it might not save any time at all
+            // We are computing more updates than minimally necessary which could be improved, but
+            // since the cost of the update scheme is so low improving that part of the code
+            // probably wont help
             compute_stencil();
 
             // Updates the water height, having separate update and compute phases
@@ -297,7 +298,7 @@ private:
         // Apply reflecting boundary conditions
 
         // The function computes more updates than necessary so it could be improved but the computation
-        // cost of the stencil is not that high, therefore it might be better to re-compute than the memory access
+        // cost of the stencil is low, therefore it will be cheaper to re-compute than the memory access
 
 #pragma omp parallel for schedule(static)
         for (size_t y = 0; y < _dimension; y++)
