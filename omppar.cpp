@@ -34,6 +34,7 @@ public:
         : _dimension(dimension), _domain(_dimension, std::vector<float>(_dimension, 0.0)),
           _net_updates(_dimension, std::vector<float>(_dimension, 0.0)), _patch_updates(0)
     {
+#pragma omp parallel for
         for (size_t y = 0; y < _dimension; y++)
         {
             for (size_t x = 0; x < _dimension; x++)
@@ -46,6 +47,7 @@ public:
     Domain() : _dimension(default_domain_size), _domain(_dimension, std::vector<float>(_dimension, 0.0)),
                _net_updates(_dimension, std::vector<float>(_dimension, 0.0)), _patch_updates(0)
     {
+#pragma omp parallel for
         for (size_t y = 0; y < _dimension; y++)
         {
             for (size_t x = 0; x < _dimension; x++)
@@ -62,7 +64,7 @@ public:
         while (!terminate_criteria_met)
         {
             /*
-            if (_patch_updates % 200 == 0)
+                        if (_patch_updates % 200 == 0)
             {
                 print();
             }
@@ -133,6 +135,7 @@ public:
 private:
     void apply_influx()
     {
+#pragma omp parallel for
         for (size_t y = 0; y < _dimension; y++)
         {
             for (size_t x = 0; x < _dimension; x++)
@@ -147,6 +150,8 @@ private:
     {
         // For evert cell with coordinates (y,x) compute the influx from neighbor cells
         // Apply reflecting boundary conditions
+
+#pragma omp parallel for
         for (size_t y = 0; y < _dimension; y++)
         {
             for (size_t x = 0; x < _dimension; x++)
@@ -174,6 +179,7 @@ private:
         std::vector<float> max_elems(_dimension, 0.0);
         std::vector<float> min_elems(_dimension, 0.0);
 
+#pragma omp parallel for
         for (size_t y = 0; y < _dimension; y++)
         {
             const std::vector<float> &row = _domain[y];

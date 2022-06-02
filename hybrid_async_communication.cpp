@@ -30,6 +30,33 @@ enum class Border : size_t
     Right
 };
 
+inline Border get_opposite_direction(Border b)
+{
+    switch (b)
+    {
+    case Border::Top:
+    {
+        return Border::Bottom;
+    }
+    case Border::Left:
+    {
+        return Border::Right;
+    }
+    case Border::Right:
+    {
+        return Border::Left;
+    }
+    case Border::Bottom:
+    {
+        return Border::Top;
+    }
+    default:
+    {
+        throw std::runtime_error("Matching Border failed");
+    }
+    }
+}
+
 class Domain
 {
 private:
@@ -59,14 +86,22 @@ private:
     // Used as a boolean but easier to have int with mpi imho
     int converged;
 
+    // Save packed data to a member variable so it outlives the async call
+    std::pair<std::vector<float>, std::vector<float>> l_and_r;
+
 public:
     Domain(size_t dimension, std::function<float(size_t, size_t)> initial_water_height,
            std::vector<std::pair<int, Border>> &&neighbors,
            int rank, int size)
         : _dimension(dimension),
           _domain(_dimension, std::vector<float>(_dimension, 0.0)),
-          _net_updates(_dimension, std::vector<float>(_dimension, 0.0)), _patch_updates(0), _neighbors(std::move(neighbors)),
-          rank_me(rank), rank_n(size), converged(0)
+          _net_updates(_dimension, std::vector<float>(_dimension, 0.0)),
+          _patch_updates(0),
+          _neighbors(std::move(neighbors)),
+          rank_me(rank),
+          rank_n(size),
+          converged(0),
+          l_and_r{}
     {
         // Initialize the domain depending on the initializer function
 #pragma omp parallel for schedule(static)
@@ -88,7 +123,7 @@ public:
     // Default constructors imagines a domain that will run on a single rank without remote communication
     Domain() : _dimension(default_domain_size), _domain(_dimension, std::vector<float>(_dimension, 0.0)),
                _net_updates(_dimension, std::vector<float>(_dimension, 0.0)), _patch_updates(0),
-               _neighbors{}, converged(0)
+               _neighbors{}, converged(0), l_and_r{}
     {
 #pragma omp parallel for schedule(static)
         for (size_t y = 0; y < _dimension - 0; y++)
@@ -107,6 +142,7 @@ public:
 
         while (!terminate_criteria_met)
         {
+
             /*
             if (_patch_updates % 200 == 0)
             {
@@ -115,17 +151,22 @@ public:
             */
 
             // Exchange ghost layer data
-            exchange_halo();
+            send_ghost_layers();
 
             // Computes the wave propogation depending on the *minecraft* like formula
             // The influx to b from a (a,b) is the same as the outflux from a to b (b,a)
             // We are computing more updates than minimally necessary which could be improved, but
             // since the cost of the update scheme is so low improving that part of the code
             // probably wont help
-            compute_stencil();
+            compute_inner_stencil();
 
             // Updates the water height, having separate update and compute phases
             // Makes it much easier to code, as there are no data races
+
+            receive_ghost_layers();
+
+            compute_outer_stencil();
+
             apply_influx();
 
             // Check globally if the termination criteria is fulfilled
@@ -214,18 +255,18 @@ private:
         return pr;
     }
 
-    void exchange_halo()
+    void send_ghost_layers()
     {
         // We saved data row major, so column (left and right boundary) messages are and not continous
         // best to pack it before sending them to remote ranks
-        std::pair<std::vector<float>, std::vector<float>> l_and_r = pack_strided_halo_to_continous();
+        l_and_r = pack_strided_halo_to_continous();
 
         // Send the edge row and columns' data to remote ranks, also receive from the neighboring ranks at the same time
         for (const auto &pr : _neighbors)
         {
             const int neighbor_rank = pr.first;
             const Border location = pr.second;
-            int retcode = -1;
+            // MPI_Status status;
 
             /*
                 For rows we dont need to copy and take the domain's line as buffer, we use our layer's Border type as a tag,
@@ -233,34 +274,29 @@ private:
                 from the list of neighbors
             */
 
+            // Can't pass NULL as req_
+            MPI_Request dummy_req;
+
             switch (location)
             {
             case Border::Top:
             {
-                retcode = MPI_Sendrecv(_domain[0].data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Top),
-                                       ghost_layers[static_cast<size_t>(Border::Top)].data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Bottom),
-                                       MPI_COMM_WORLD, NULL);
+                MPI_Isend(_domain[0].data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Top), MPI_COMM_WORLD, &dummy_req);
                 break;
             }
             case Border::Bottom:
             {
-                retcode = MPI_Sendrecv(_domain[_dimension - 1].data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Bottom),
-                                       ghost_layers[static_cast<size_t>(Border::Bottom)].data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Top),
-                                       MPI_COMM_WORLD, NULL);
+                MPI_Isend(_domain[_dimension - 1].data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Bottom), MPI_COMM_WORLD, &dummy_req);
                 break;
             }
             case Border::Left:
             {
-                retcode = MPI_Sendrecv(l_and_r.first.data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Left),
-                                       ghost_layers[static_cast<size_t>(Border::Left)].data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Right),
-                                       MPI_COMM_WORLD, NULL);
+                MPI_Isend(l_and_r.first.data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Left), MPI_COMM_WORLD, &dummy_req);
                 break;
             }
             case Border::Right:
             {
-                retcode = MPI_Sendrecv(l_and_r.second.data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Right),
-                                       ghost_layers[static_cast<size_t>(Border::Right)].data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Left),
-                                       MPI_COMM_WORLD, NULL);
+                MPI_Isend(l_and_r.second.data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Right), MPI_COMM_WORLD, &dummy_req);
                 break;
             }
             default:
@@ -268,13 +304,54 @@ private:
                 throw std::runtime_error("Unhandled case");
             }
             }
+        }
+    }
 
-            // Just in case
-            if (retcode != MPI_SUCCESS)
+    void receive_ghost_layers()
+    {
+        size_t must_receive = _neighbors.size();
+
+        /*
+        volatile size_t received = 0;
+
+        //Something worth also having is, if you do not now the message size, you can use Iprobe, get_count and Recv!
+
+        while (received < must_receive)
+        {
+            for (const auto &pr : _neighbors)
             {
-                throw std::runtime_error(std::to_string(retcode));
+                int from = pr.first;
+                Border tag_type = pr.second;
+                int flag = 0;
+                MPI_Statzs stat;
+                int count = 0;
+
+                MPI_Iprobe(from, static_cast<size_t>(get_opposite_direction(tag_type)), MPI_COMM_WORLD, &flag, &stat);
+
+                if (flag)
+                {
+                    received += 1;
+                    MPI_Get_count(&stat, MPI_FLOAT, &count);
+                    MPI_Recv(...);
+                }
             }
         }
+        */
+
+        std::vector<MPI_Request> req_vec(must_receive);
+
+        for (size_t i = 0; i < _neighbors.size(); i++)
+        {
+            int from = _neighbors[i].first;
+            Border expected_tag = get_opposite_direction(_neighbors[i].second);
+            // Border expected_tag = _neighbors[i].second;
+            size_t tag_offset = static_cast<size_t>(_neighbors[i].second);
+            assert(tag_offset < 4);
+
+            MPI_Irecv(ghost_layers[tag_offset].data(), _dimension, MPI_FLOAT, from, static_cast<size_t>(expected_tag), MPI_COMM_WORLD, &req_vec[i]);
+        }
+
+        MPI_Waitall(req_vec.size(), req_vec.data(), NULL);
     }
 
     // Update water heights
@@ -290,18 +367,13 @@ private:
         }
     }
 
-    void compute_stencil()
+    void compute_inner_stencil()
     {
-        // For evert cell with coordinates (y,x) compute the influx from neighbor cells
-        // Apply reflecting boundary conditions
-
-        // The function computes more updates than necessary so it could be improved but the computation
-        // cost of the stencil is low, therefore it will be cheaper to re-compute than the memory access
-
+        // Iterate through inner cells
 #pragma omp parallel for schedule(static)
-        for (size_t y = 0; y < _dimension; y++)
+        for (size_t y = 1; y < _dimension - 1; y++)
         {
-            for (size_t x = 0; x < _dimension; x++)
+            for (size_t x = 1; x < _dimension - 1; x++)
             {
                 // This is inline so vector allocation here should not cause a problem
                 std::vector<std::pair<size_t, size_t>> neighbors = get_neighbors(y, x);
@@ -318,28 +390,81 @@ private:
                     update += difference / viscosity_factor;
                 }
 
-                // If we are not in a true corner, we need to check the ghost layers and ask them for water height
-                if (x == 0 && !ghost_layers[static_cast<size_t>(Border::Left)].empty())
-                {
-                    difference = ghost_layers[static_cast<size_t>(Border::Left)][y] - cell_water;
-                    update += difference / viscosity_factor;
-                }
-                if (x == _dimension - 1 && !ghost_layers[static_cast<size_t>(Border::Right)].empty())
-                {
-                    difference = ghost_layers[static_cast<size_t>(Border::Right)][y] - cell_water;
-                    update += difference / viscosity_factor;
-                }
-                if (y == _dimension - 1 && !ghost_layers[static_cast<size_t>(Border::Bottom)].empty())
-                {
-                    difference = ghost_layers[static_cast<size_t>(Border::Bottom)][x] - cell_water;
-                    update += difference / viscosity_factor;
-                }
-                if (y == 0 && !ghost_layers[static_cast<size_t>(Border::Top)].empty())
-                {
-                    difference = ghost_layers[static_cast<size_t>(Border::Top)][x] - cell_water;
-                    update += difference / viscosity_factor;
-                }
+                _net_updates[y][x] = update;
+            }
+        }
+    }
 
+    inline float get_update(size_t y, size_t x, std::vector<std::pair<size_t, size_t>> &neighbors)
+    {
+        float cell_water = _domain[y][x];
+        float update = 0.0;
+        float difference = 0.0;
+
+        for (auto &coordinates : neighbors)
+        {
+            difference = _domain[coordinates.first][coordinates.second] - cell_water;
+
+            // If the difference is positive influx is positive otherwise negative
+            update += difference / viscosity_factor;
+        }
+
+        // If we are not in a true corner, we need to check the ghost layers and ask them for water height
+        if (x == 0 && !ghost_layers[static_cast<size_t>(Border::Left)].empty())
+        {
+            difference = ghost_layers[static_cast<size_t>(Border::Left)][y] - cell_water;
+            update += difference / viscosity_factor;
+        }
+        if (x == _dimension - 1 && !ghost_layers[static_cast<size_t>(Border::Right)].empty())
+        {
+            difference = ghost_layers[static_cast<size_t>(Border::Right)][y] - cell_water;
+            update += difference / viscosity_factor;
+        }
+        if (y == _dimension - 1 && !ghost_layers[static_cast<size_t>(Border::Bottom)].empty())
+        {
+            difference = ghost_layers[static_cast<size_t>(Border::Bottom)][x] - cell_water;
+            update += difference / viscosity_factor;
+        }
+        if (y == 0 && !ghost_layers[static_cast<size_t>(Border::Top)].empty())
+        {
+            difference = ghost_layers[static_cast<size_t>(Border::Top)][x] - cell_water;
+            update += difference / viscosity_factor;
+        }
+
+        return update;
+    }
+
+    void compute_outer_stencil()
+    {
+        // For evert cell with coordinates (y,x) compute the influx from neighbor cells
+        // Apply reflecting boundary conditions
+
+        // The function computes more updates than necessary so it could be improved but the computation
+        // cost of the stencil is low, therefore it will be cheaper to re-compute than the memory access
+        std::array<size_t, 2> pos{0, _dimension - 1};
+
+        for (size_t y : pos)
+        {
+#pragma omp parallel for
+            for (size_t x = 0; x < _dimension; x++)
+            {
+                // This is inline so vector allocation here should not cause a problem
+                std::vector<std::pair<size_t, size_t>> neighbors = get_neighbors(y, x);
+
+                float update = get_update(y, x, neighbors);
+                _net_updates[y][x] = update;
+            }
+        }
+
+#pragma omp parallel for
+        for (size_t y = 0; y < _dimension; y++)
+        {
+            for (size_t x : pos)
+            {
+                // This is inline so vector allocation here should not cause a problem
+                std::vector<std::pair<size_t, size_t>> neighbors = get_neighbors(y, x);
+
+                float update = get_update(y, x, neighbors);
                 _net_updates[y][x] = update;
             }
         }
