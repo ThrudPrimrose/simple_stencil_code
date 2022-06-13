@@ -35,6 +35,7 @@ class Domain
 private:
     // Size of 1 dimension, in the end we have a square of _d x _d
     size_t _dimension;
+    size_t _culled_dimension;
 
     // Matrix to hold cell data
     std::vector<std::vector<float>> _domain;
@@ -63,18 +64,18 @@ public:
     Domain(size_t dimension, std::function<float(size_t, size_t)> initial_water_height,
            std::vector<std::pair<int, Border>> &&neighbors,
            int rank, int size)
-        : _dimension(dimension),
-          _domain(_dimension, std::vector<float>(_dimension, 0.0)),
-          _net_updates(_dimension, std::vector<float>(_dimension, 0.0)), _patch_updates(0), _neighbors(std::move(neighbors)),
+        : _dimension(dimension), _culled_dimension(dimension / 4),
+          _domain(_culled_dimension, std::vector<float>(_dimension, 0.0)),
+          _net_updates(_culled_dimension, std::vector<float>(_dimension, 0.0)), _patch_updates(0), _neighbors(std::move(neighbors)),
           rank_me(rank), rank_n(size), converged(0)
     {
         // Initialize the domain depending on the initializer function
 #pragma omp parallel for schedule(static)
-        for (size_t y = 0; y < _dimension; y++)
+        for (size_t y = 0; y < _culled_dimension; y++)
         {
             for (size_t x = 0; x < _dimension; x++)
             {
-                _domain[y][x] = initial_water_height(y, x);
+                _domain[y][x] = initial_water_height(y + ((rank_me * _dimension)), x);
             }
         }
 
@@ -91,11 +92,11 @@ public:
                _neighbors{}, converged(0)
     {
 #pragma omp parallel for schedule(static)
-        for (size_t y = 0; y < _dimension; y++)
+        for (size_t y = 0; y < _culled_dimension; y++)
         {
             for (size_t x = 0; x < _dimension; x++)
             {
-                _domain[y][x] = symmetric_dambreak(y, x);
+                _domain[y][x] = symmetric_dambreak(y + ((rank_me * _dimension)), x);
             }
         }
     }
@@ -141,7 +142,7 @@ public:
     void print()
     {
         std::vector<float> row_max;
-        row_max.reserve(_dimension);
+        row_max.reserve(_culled_dimension);
         for (const auto &row : _domain)
         {
             row_max.push_back(*std::max_element(row.begin(), row.end()));
@@ -197,28 +198,9 @@ private:
         can implement the packing better than the user level code, but this is very rarely the case and needs specific
         optimized mpi implementations, could be test too
     */
-    std::pair<std::vector<float>, std::vector<float>> pack_strided_halo_to_continous()
-    {
-        std::pair<std::vector<float>, std::vector<float>> pr;
-        std::vector<float> &left = pr.first;
-        std::vector<float> &right = pr.second;
-        left.reserve(_dimension);
-        right.reserve(_dimension);
-
-        for (size_t y = 0; y < _dimension; y++)
-        {
-            left.push_back(_domain[y][0]);
-            right.push_back(_domain[y][_dimension - 1]);
-        }
-
-        return pr;
-    }
 
     void exchange_halo()
     {
-        // We saved data row major, so column (left and right boundary) messages are and not continous
-        // best to pack it before sending them to remote ranks
-        std::pair<std::vector<float>, std::vector<float>> l_and_r = pack_strided_halo_to_continous();
 
         // Send the edge row and columns' data to remote ranks, also receive from the neighboring ranks at the same time
         for (const auto &pr : _neighbors)
@@ -244,22 +226,8 @@ private:
             }
             case Border::Bottom:
             {
-                retcode = MPI_Sendrecv(_domain[_dimension - 1].data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Bottom),
+                retcode = MPI_Sendrecv(_domain[_culled_dimension - 1].data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Bottom),
                                        ghost_layers[static_cast<size_t>(Border::Bottom)].data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Top),
-                                       MPI_COMM_WORLD, NULL);
-                break;
-            }
-            case Border::Left:
-            {
-                retcode = MPI_Sendrecv(l_and_r.first.data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Left),
-                                       ghost_layers[static_cast<size_t>(Border::Left)].data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Right),
-                                       MPI_COMM_WORLD, NULL);
-                break;
-            }
-            case Border::Right:
-            {
-                retcode = MPI_Sendrecv(l_and_r.second.data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Right),
-                                       ghost_layers[static_cast<size_t>(Border::Right)].data(), _dimension, MPI_FLOAT, neighbor_rank, static_cast<size_t>(Border::Left),
                                        MPI_COMM_WORLD, NULL);
                 break;
             }
@@ -281,7 +249,7 @@ private:
     void apply_influx()
     {
 #pragma omp parallel for schedule(static)
-        for (size_t y = 0; y < _dimension; y++)
+        for (size_t y = 0; y < _culled_dimension; y++)
         {
             for (size_t x = 0; x < _dimension; x++)
             {
@@ -299,7 +267,7 @@ private:
         // cost of the stencil is low, therefore it will be cheaper to re-compute than the memory access
 
 #pragma omp parallel for schedule(static)
-        for (size_t y = 0; y < _dimension; y++)
+        for (size_t y = 0; y < _culled_dimension; y++)
         {
             for (size_t x = 0; x < _dimension; x++)
             {
@@ -319,16 +287,6 @@ private:
                 }
 
                 // If we are not in a true corner, we need to check the ghost layers and ask them for water height
-                if (x == 0 && !ghost_layers[static_cast<size_t>(Border::Left)].empty())
-                {
-                    difference = ghost_layers[static_cast<size_t>(Border::Left)][y] - cell_water;
-                    update += difference / viscosity_factor;
-                }
-                if (x == _dimension - 1 && !ghost_layers[static_cast<size_t>(Border::Right)].empty())
-                {
-                    difference = ghost_layers[static_cast<size_t>(Border::Right)][y] - cell_water;
-                    update += difference / viscosity_factor;
-                }
                 if (y == _dimension - 1 && !ghost_layers[static_cast<size_t>(Border::Bottom)].empty())
                 {
                     difference = ghost_layers[static_cast<size_t>(Border::Bottom)][x] - cell_water;
@@ -350,11 +308,11 @@ private:
     // How to be globally reduced
     bool termination_criteria_fulfilled() const
     {
-        std::vector<float> max_elems(_dimension, 0.0);
-        std::vector<float> min_elems(_dimension, 0.0);
+        std::vector<float> max_elems(_culled_dimension, 0.0);
+        std::vector<float> min_elems(_culled_dimension, 0.0);
 
 #pragma omp parallel for
-        for (size_t y = 0; y < _dimension; y++)
+        for (size_t y = 0; y < _culled_dimension; y++)
         {
             const std::vector<float> &row = _domain[y];
             auto mm = std::minmax_element(std::begin(row), std::end(row));
@@ -404,7 +362,7 @@ private:
         }
 
         // Add lower neighbor
-        if (y != _dimension - 1)
+        if (y != _culled_dimension - 1)
         {
             neighbors.emplace_back(y + 1, x);
         }
@@ -435,7 +393,7 @@ int main(int argc, char *argv[])
     {
     case 0:
     {
-        neighbors = std::vector<std::pair<int, Border>>{{1, Border::Right}, {2, Border::Bottom}};
+        neighbors = std::vector<std::pair<int, Border>>{{1, Border::Bottom}};
         local_symmetric_dambreak = [domain_size, dambreak_offset](size_t y, size_t x) -> float
         {
             if ((x < dambreak_offset) || (x > domain_size - dambreak_offset))
@@ -449,10 +407,10 @@ int main(int argc, char *argv[])
     }
     case 1:
     {
-        neighbors = std::vector<std::pair<int, Border>>{{0, Border::Left}, {3, Border::Bottom}};
+        neighbors = std::vector<std::pair<int, Border>>{{0, Border::Top}, {2, Border::Bottom}};
         local_symmetric_dambreak = [domain_size, dambreak_offset](size_t y, size_t x) -> float
         {
-            if ((x + 51 < dambreak_offset) || (x + ((domain_size / 2) + 1) > domain_size - dambreak_offset))
+            if ((x < dambreak_offset) || (x > domain_size - dambreak_offset))
             {
                 return 20.0;
             }
@@ -463,7 +421,7 @@ int main(int argc, char *argv[])
     }
     case 2:
     {
-        neighbors = std::vector<std::pair<int, Border>>{{0, Border::Top}, {3, Border::Right}};
+        neighbors = std::vector<std::pair<int, Border>>{{1, Border::Top}, {3, Border::Bottom}};
         local_symmetric_dambreak = [domain_size, dambreak_offset](size_t y, size_t x) -> float
         {
             if ((x < dambreak_offset) || (x > domain_size - dambreak_offset))
@@ -477,11 +435,11 @@ int main(int argc, char *argv[])
     }
     case 3:
     {
-        neighbors = std::vector<std::pair<int, Border>>{{2, Border::Left}, {1, Border::Top}};
+        neighbors = std::vector<std::pair<int, Border>>{{2, Border::Top}};
 
         local_symmetric_dambreak = [domain_size, dambreak_offset](size_t y, size_t x) -> float
         {
-            if ((x + 51 < dambreak_offset) || (x + ((domain_size / 2) + 1) > domain_size - dambreak_offset))
+            if ((x < dambreak_offset) || (x > domain_size - dambreak_offset))
             {
                 return 20.0;
             }
@@ -496,7 +454,7 @@ int main(int argc, char *argv[])
     }
     }
 
-    Domain d(domain_size / 2, local_symmetric_dambreak, std::move(neighbors), rank, size);
+    Domain d(domain_size, local_symmetric_dambreak, std::move(neighbors), rank, size);
     unsigned long long p_up = d.simulate();
 
     if (rank == 0)

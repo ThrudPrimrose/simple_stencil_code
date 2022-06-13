@@ -50,7 +50,7 @@ public:
         {
             for (size_t x = 0; x < _dimension; x++)
             {
-                _domain[y][x] = symmetric_dambreak(x, y);
+                _domain[y][x] = symmetric_dambreak(y, x);
             }
         }
     }
